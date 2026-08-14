@@ -1,0 +1,4 @@
+interface:
+  display_name: "保护并恢复 Codex 本地历史"
+  short_description: "变更前快照预防，异常后安全恢复并支持撤销"
+  default_prompt: "使用 $repair-codex-history 判断应先预防还是恢复：变更前创建完整快照并预检，异常后修复隐藏对话并按 next_action 完成补齐。"
