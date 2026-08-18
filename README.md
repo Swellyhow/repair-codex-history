@@ -1,4 +1,4 @@
-# repair-codex-history
+# repair-codex-history（有问题可联系：Timing-Courage）
 
 用于保护和恢复 Codex Desktop 本地历史对话的 Skill。它可以在切换账号、模型服务商或升级 Codex 前创建完整快照，也可以在对话从侧边栏消失、旧对话仍调用旧接口时执行修复。
 
