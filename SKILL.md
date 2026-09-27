@@ -1,93 +1,111 @@
 ---
 name: repair-codex-history
-description: Prevent and repair local Codex Desktop history problems around account, model-provider, configuration, or app changes. Use before switching accounts/providers or upgrading Codex to create a verified snapshot and preflight migration, and after changes when tasks disappear, old conversations call an old URL, history vanishes again after restart, all local history must be restored, or a repair must be undone.
+description: Prevent and repair local Codex Desktop history problems around account, model-provider, configuration, or app changes. Use to install one-time continuity/pre-launch mode, create verified snapshots before changes, repair hidden local threads after changes, generate a safe handoff when encrypted session content cannot be resumed, or undo a repair.
 ---
 
 # Repair Codex History
 
-Protect local user-owned tasks before risky changes, then recover them when necessary by migrating both the SQLite index and rollout provider metadata. Back up every changed file exactly and never read or modify `auth.json`.
+Protect local user-owned tasks before risky changes, recover hidden tasks after provider changes, and optionally install a Windows pre-launch continuity guard. The guard is a one-shot process that runs before Codex starts; it is never a background watcher or service. Back up every changed file exactly and never read or modify `auth.json`.
 
-## Prevention First
+## Choose the workflow
 
-Use this path when the user has not switched accounts/providers or upgraded Codex yet.
+Use **continuity setup** when the user wants future account/provider switches to require only “quit Codex, then launch through Codex Continuity”. Use **recovery** when history is already hidden or a thread still points at an old provider. Use **handoff** only when a visible thread cannot be resumed by the current backend.
 
-1. Run a read-only scan.
-2. Create a full verified snapshot before any configuration or account change:
+## Continuity setup (Windows)
 
-   ```bash
-   python3 scripts/repair_history.py snapshot --yes --json
+1. Run a read-only diagnostic:
+
+   ```powershell
+   python scripts/repair_history.py doctor --json
    ```
 
-3. Require `snapshot_complete: true`. Report the backup directory, rollout count, byte count, locked rollouts captured, and manifest. A snapshot reads locked rollouts only after two identical reads and never modifies them.
-4. For a provider switch, first ensure the target provider table already exists in `config.toml`, then proactively migrate history before changing the top-level provider:
+2. If the user explicitly requested one-time continuity mode, run:
 
-   ```bash
-   python3 scripts/repair_history.py repair --provider TARGET --yes --json
+   ```powershell
+   python scripts/repair_history.py bootstrap --yes --json
    ```
 
-5. After the proactive migration, change the configured provider, restart Codex, scan again, and follow `next_action`. Locked active tasks may still require the normal second pass.
-6. For an account-only change that keeps the same provider, preserve the snapshot, switch accounts, then scan immediately after reopening Codex.
-7. Keep the last verified snapshot and repair backup until the post-change scan reports `repair_complete: true` and `next_action: none`.
+3. Require `bootstrap_complete: true` and report the snapshot, repair backup, and `Codex Continuity` shortcut path. Bootstrap creates a full snapshot, aligns user-thread provider metadata, installs the Windows launcher, and verifies the result.
+4. If `next_action` is `quit_codex_and_retry`, stop and have the user fully exit Codex before retrying. If it is `inspect_missing_rollouts`, do not modify anything further. If it is `install_guard`, report the installer failure and preserve the snapshot for inspection.
+5. Explain the daily workflow: switch account/provider, fully quit Codex, and launch from `Codex Continuity`.
 
-## Recovery Workflow
+Bootstrap is currently Windows-only because the bundled launcher uses the Windows Start Menu/AppUserModelID. Do not install a watcher, scheduled task, service, or resident Python process. Do not replace the original Codex shortcut unless the user explicitly asks for that behavior.
 
-1. Locate this skill directory and use `scripts/repair_history.py` from it.
-2. Run a read-only scan first:
+## Pre-launch Guard
+
+The launcher runs:
+
+```powershell
+python scripts/repair_history.py guard --yes --json
+```
+
+On the fast path, when user-thread provider metadata already matches the current provider, Guard returns `guard_complete: true`, `changed: false`, and `next_action: launch` without creating a backup. On the repair path, it rechecks Codex and writer locks, validates SQLite, creates a differential repair backup, updates only provider metadata, verifies the result, and returns `next_action: launch`.
+
+Guard uses index-only repair by design. It must not create compatibility aliases or modify `config.toml`, provider endpoints, API keys, OAuth settings, or CC Switch state. The source of truth is the final Codex configuration, regardless of whether the switch came from CC Switch, Codex login, a manual edit, or another tool. `auth.json` is never opened.
+
+If Codex is still running or a writer lock remains, return `quit_codex_and_retry`. Never delete locks, kill processes, or edit active rollouts. If the schema is unknown, SQLite integrity fails, or a rollout is missing, stop safely and report the corresponding `next_action`.
+
+## Recovery workflow
+
+1. Locate this skill directory and run a read-only scan:
 
    ```bash
    python3 scripts/repair_history.py scan --json
    ```
 
-3. Report the detected Codex home, database, current provider, user-task count, hidden count, archived count, runtime-provider mismatch count, writer-locked mismatch count, internal subagent count, missing rollout-file count, `repair_complete`, and `next_action`.
-4. Stop without changing anything when:
-   - the user requested inspection only;
-   - the database schema is unsupported;
-   - SQLite integrity fails;
-   - no current provider can be determined;
-   - rollout files are unexpectedly missing and the user has not acknowledged that risk.
-5. When the user explicitly asks to repair or restore, run:
+2. Report the Codex home, database, current provider, user-task count, hidden count, archived count, runtime-provider mismatch count, writer-locked mismatch count, internal subagent count, missing rollout count, `repair_complete`, and `next_action`.
+3. Stop without changing anything when the user requested inspection only, the schema is unsupported, SQLite integrity fails, the provider is unknown, or rollout files are missing.
+4. When the user asks to repair or restore, run:
 
    ```bash
    python3 scripts/repair_history.py repair --yes --json
    ```
 
-6. Preserve archived status by default. Add `--unarchive` only when the user explicitly asks for archived tasks to return to the main sidebar.
-7. The repair changes only `session_meta.payload.model_provider` in unlocked rollout JSONL files. It preserves all conversation messages and tool outputs byte-for-byte, stores exact originals with SHA-256 hashes, and updates SQLite consistently.
-8. By default, also synchronize every custom legacy rollout provider as a compatibility alias of the current provider for already loaded sessions. Use `--index-only` only when the user explicitly wants to skip aliases.
-   - Keep reserved built-in providers such as `openai`, `oss`, `ollama`, and `lmstudio` unchanged.
-9. After repair, report the backup directory, SQLite rows changed, rollout files changed, session metadata events changed, aliases synchronized, writer-locked tasks skipped, `repair_complete`, and `next_action`.
-10. Follow `next_action` exactly:
-    - `restart_and_rerun`: quit and reopen Codex, then run the same scan and repair again. The first pass intentionally skipped active old-provider rollouts.
-    - `restart_to_reload`: the persistent migration is complete; reopen Codex once to reload the sidebar, but do not claim another repair pass is required.
-    - `repair` or `repair_again`: run the repair command when safety checks permit.
-    - `inspect_missing_rollouts`: stop and report that local rollout files are absent.
-    - `none`: no further action is needed.
-11. Treat `rerun_required_after_restart`, not the older `restart_required` field alone, as the signal for a mandatory second repair pass.
-12. A no-op repair is valid and creates no backup. When `changed` is false and `backup_directory` is null, report the verified state without implying that files were rewritten.
+5. Preserve archived status by default. Add `--unarchive` only when explicitly requested. Use `--index-only` only when the user explicitly wants to skip compatibility aliases; Guard and bootstrap already use index-only repair.
+6. Report the backup directory, SQLite rows changed, rollout files changed, metadata events changed, aliases synchronized, locked tasks skipped, `repair_complete`, and `next_action`.
 
-## Undo
+The repair changes only `session_meta.payload.model_provider` in unlocked rollout JSONL files and `threads.model_provider` in the verified SQLite schema. It preserves messages and tool outputs, records before/after SHA-256 hashes, and uses an operation manifest for undo. A no-op repair is valid and should not be described as a rewrite.
 
-Use the manifest from the repair output. Prefer manifest-based undo over replacing the entire live database because it preserves tasks created after the repair.
+## Handoff fallback
+
+Provider metadata repair restores local visibility, but it cannot make a backend decrypt another backend's `encrypted_content`. If a visible thread cannot resume, preserve the original and run:
 
 ```bash
-python3 scripts/repair_history.py undo --backup /path/to/backup-directory --yes --json
+python3 scripts/repair_history.py handoff --thread THREAD_ID --json
 ```
 
-Use `--latest` only when the user clearly wants to undo the most recent repair.
-Never pass a snapshot manifest to `undo`; snapshots are complete recovery copies, not change manifests.
+The command writes `HANDOFF.md`, `metadata.json`, and a source hash manifest under `~/.codex/history-repair-handoffs/<thread-id>/<timestamp>/`. It extracts readable user/assistant text and basic session metadata only. It excludes tool output, hidden reasoning, `encrypted_content`, and credentials. Never delete or rewrite the original Thread to make handoff appear successful.
 
-## Safety Rules
+## Snapshot and undo
 
-- Treat this as a local compatibility repair, not cloud-account recovery.
-- Never claim to recover conversations whose rollout files are absent locally.
-- Prefer prevention mode before a known account, provider, configuration, or app change; use recovery mode only after the state has already diverged.
-- Never edit `auth.json`, API keys, cookies, conversation messages, or tool outputs.
-- Modify only `session_meta.payload.model_provider` in rollout JSONL files, after byte-for-byte backup and before/after SHA-256 recording.
-- Copy the current provider configuration into compatibility aliases; never copy an old provider endpoint forward.
+Before a known change, use:
+
+```bash
+python3 scripts/repair_history.py snapshot --yes --json
+```
+
+For a provider switch with an already configured target provider, proactive migration remains available:
+
+```bash
+python3 scripts/repair_history.py repair --provider TARGET --yes --json
+```
+
+Undo a repair, Guard repair, or bootstrap migration with its operation manifest:
+
+```bash
+python3 scripts/repair_history.py undo --backup /path/to/repair-backup --yes --json
+```
+
+Never pass a full snapshot manifest to `undo`; snapshots are disaster-recovery copies, while undo requires the operation manifest and protects work created after the repair.
+
+## Safety rules
+
+- Treat this as a local compatibility and continuity tool, not cloud-account recovery.
+- Never claim to recover a conversation whose rollout file is absent locally.
+- Never edit `auth.json`, API keys, cookies, OAuth tokens, messages, assistant content, tool output, or `encrypted_content`.
+- Copy the current provider configuration into compatibility aliases only in explicit manual `repair`; never copy an old endpoint forward. Guard/bootstrap do not create aliases.
 - Never hardcode a username, provider name, Codex home, or database version.
-- Exclude internal subagent threads from normal user-task migration.
-- Treat writer-lock files as a restart-and-rerun signal, not as permission to delete locks, kill processes, or edit active rollouts.
-- Recheck writer locks immediately before backup and replacement. If a new lock appears after the scan, stop and rerun instead of modifying that rollout.
-- Keep the generated database backup and manifest until the user verifies the result.
-- Do not replace the live database wholesale from a snapshot; use manifest-based repair/undo so tasks created later are preserved.
-- Do not improvise raw SQL when the bundled script rejects an unknown schema; update and retest the script instead.
+- Exclude internal subagent threads from normal user history migration.
+- Recheck locks immediately before backup and replacement; a new lock means stop and retry.
+- Keep backups and manifests until the user verifies the result.
+- Do not replace the live database wholesale from a snapshot or improvise SQL for an unknown schema.

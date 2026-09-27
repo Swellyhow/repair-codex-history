@@ -1,4 +1,4 @@
 interface:
-  display_name: "保护并恢复 Codex 本地历史"
-  short_description: "变更前快照预防，异常后安全恢复并支持撤销"
-  default_prompt: "使用 $repair-codex-history 判断应先预防还是恢复：变更前创建完整快照并预检，异常后修复隐藏对话并按 next_action 完成补齐。"
+  display_name: "Codex 本地历史连续性"
+  short_description: "安装启动前 Guard，安全恢复并支持撤销"
+  default_prompt: "使用 $repair-codex-history 先运行 doctor：如果用户要长期无感切换，执行一次 bootstrap 安装非后台 Guard；如果历史已隐藏，执行 scan/repair；跨 backend 无法续接时生成 handoff，并严格遵循 next_action。"

@@ -12,15 +12,24 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import uuid
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
-SCRIPT_VERSION = 5
+SCRIPT_VERSION = 6
+GUARD_STATE_FIELDS = {
+    "last_provider",
+    "last_guard_time",
+    "last_guard_version",
+    "last_manifest",
+    "last_result",
+}
 REQUIRED_COLUMNS = {
     "id",
     "rollout_path",
@@ -46,6 +55,16 @@ class RepairError(RuntimeError):
     pass
 
 
+class ManagedConnection(sqlite3.Connection):
+    """Close SQLite connections when their transaction context exits."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -61,6 +80,14 @@ def resolve_codex_home(value: str | None) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".codex").resolve()
+
+
+def resolve_rollout_path(path_value: str, codex_home: Path | None = None) -> Path:
+    """Resolve rollout paths stored by either old or current Codex versions."""
+    path = Path(path_value).expanduser()
+    if not path.is_absolute() and codex_home is not None:
+        path = codex_home / path
+    return path.resolve()
 
 
 def parse_provider(config_path: Path, override: str | None) -> tuple[str, str]:
@@ -321,9 +348,14 @@ def resolve_database(codex_home: Path, value: str | None) -> Path:
 
 def open_database(path: Path, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro",
+            uri=True,
+            timeout=10,
+            factory=ManagedConnection,
+        )
     else:
-        conn = sqlite3.connect(path, timeout=10)
+        conn = sqlite3.connect(path, timeout=10, factory=ManagedConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("pragma busy_timeout = 10000")
     return conn
@@ -367,8 +399,8 @@ def load_threads(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def rollout_provider_values(path_value: str) -> list[str]:
-    path = Path(path_value).expanduser()
+def rollout_provider_values(path_value: str, codex_home: Path | None = None) -> list[str]:
+    path = resolve_rollout_path(path_value, codex_home)
     if not path.is_file():
         return []
     values: list[str] = []
@@ -391,6 +423,62 @@ def rollout_provider_values(path_value: str) -> list[str]:
     except OSError:
         return []
     return values
+
+
+def rollout_first_provider(
+    path_value: str, codex_home: Path | None = None, max_bytes: int = 128 * 1024
+) -> str | None:
+    """Read only the metadata prefix used by the guard fast path.
+
+    Codex writes session_meta near the start of a rollout. If a file does not
+    expose it in the bounded prefix, return None so the caller falls back to a
+    complete, conservative analysis instead of allowing a false launch.
+    """
+    path = resolve_rollout_path(path_value, codex_home)
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as handle:
+            remaining = max_bytes
+            for raw_line in handle:
+                remaining -= len(raw_line)
+                if remaining < 0:
+                    break
+                try:
+                    event = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "session_meta":
+                    continue
+                payload = event.get("payload")
+                value = payload.get("model_provider") if isinstance(payload, dict) else None
+                return value if isinstance(value, str) and value else None
+    except OSError:
+        return None
+    return None
+
+
+def quick_rollout_check(
+    user_rows: Iterable[dict[str, Any]], provider: str, codex_home: Path
+) -> tuple[int, int, bool]:
+    """Return (missing files, mismatched files, metadata_unknown).
+
+    This checks file existence and only the bounded metadata prefix. It never
+    walks conversation bodies on the no-change path.
+    """
+    missing = mismatched = 0
+    unknown = False
+    for row in user_rows:
+        path = resolve_rollout_path(row["rollout_path"], codex_home)
+        if not path.is_file():
+            missing += 1
+            continue
+        value = rollout_first_provider(row["rollout_path"], codex_home)
+        if value is None:
+            unknown = True
+        elif value != provider:
+            mismatched += 1
+    return missing, mismatched, unknown
 
 
 def split_line_ending(raw_line: bytes) -> tuple[bytes, bytes]:
@@ -445,13 +533,13 @@ def prepare_rollout_rewrite(path: Path, provider: str) -> tuple[bytes, bytes, in
 
 
 def rollout_provider_analysis(
-    user_rows: Iterable[dict[str, Any]], provider: str
+    user_rows: Iterable[dict[str, Any]], provider: str, codex_home: Path | None = None
 ) -> tuple[Counter[str], list[dict[str, Any]], int]:
     counts: Counter[str] = Counter()
     mismatches: list[dict[str, Any]] = []
     missing_meta = 0
     for row in user_rows:
-        values = rollout_provider_values(row["rollout_path"])
+        values = rollout_provider_values(row["rollout_path"], codex_home)
         if not values:
             missing_meta += 1
             continue
@@ -476,6 +564,143 @@ def writer_lock_ids(codex_home: Path) -> set[str]:
     return {path.stem for path in lock_directory.glob("*.lock") if path.is_file()}
 
 
+def guard_state_path(codex_home: Path) -> Path:
+    return codex_home / "history-repair-state" / "guard-state.json"
+
+
+def read_guard_state(codex_home: Path) -> dict[str, Any] | None:
+    path = guard_state_path(codex_home)
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != GUARD_STATE_FIELDS:
+        return None
+    if not (
+        isinstance(value.get("last_provider"), str)
+        and isinstance(value.get("last_guard_time"), str)
+        and isinstance(value.get("last_guard_version"), int)
+        and isinstance(value.get("last_manifest"), (str, type(None)))
+        and isinstance(value.get("last_result"), dict)
+    ):
+        return None
+    return value
+
+
+def rollout_fingerprints(
+    user_rows: Iterable[dict[str, Any]], codex_home: Path
+) -> dict[str, tuple[int, int]] | None:
+    fingerprints: dict[str, tuple[int, int]] = {}
+    try:
+        for row in user_rows:
+            path = resolve_rollout_path(row["rollout_path"], codex_home)
+            stat_result = path.stat()
+            if not path.is_file():
+                return None
+            fingerprints[row["id"]] = (stat_result.st_size, stat_result.st_mtime_ns)
+    except OSError:
+        return None
+    return fingerprints
+
+
+def guard_state_matches(
+    state: dict[str, Any] | None,
+    provider: str,
+    user_rows: Iterable[dict[str, Any]],
+    codex_home: Path,
+) -> bool:
+    if (
+        not state
+        or state["last_provider"] != provider
+        or state["last_guard_version"] != SCRIPT_VERSION
+        or state["last_result"].get("status") != "launch"
+    ):
+        return False
+    previous = state["last_result"].get("rollouts")
+    current = rollout_fingerprints(user_rows, codex_home)
+    if current is None or not isinstance(previous, dict):
+        return False
+    normalized = {
+        str(thread_id): (int(values[0]), int(values[1]))
+        for thread_id, values in previous.items()
+        if isinstance(values, list)
+        and len(values) == 2
+        and all(isinstance(item, int) for item in values)
+    }
+    return len(normalized) == len(previous) and normalized == current
+
+
+def write_guard_state(
+    codex_home: Path,
+    provider: str,
+    result: str,
+    manifest: str | None = None,
+    user_rows: Iterable[dict[str, Any]] | None = None,
+) -> bool:
+    fingerprints = rollout_fingerprints(user_rows or [], codex_home)
+    payload = {
+        "last_provider": provider,
+        "last_guard_time": utc_now(),
+        "last_guard_version": SCRIPT_VERSION,
+        "last_manifest": manifest,
+        "last_result": {
+            "status": result,
+            "rollouts": {
+                thread_id: [size, modified]
+                for thread_id, (size, modified) in (fingerprints or {}).items()
+            },
+        },
+    }
+    try:
+        path = guard_state_path(codex_home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def fast_guard_report(
+    rows: Iterable[dict[str, Any]],
+    provider: str,
+    codex_home: Path,
+    database: Path,
+    missing_rollouts: int,
+) -> dict[str, Any]:
+    rows = list(rows)
+    user_rows = [row for row in rows if not is_internal_source(row["source"])]
+    internal_rows = [row for row in rows if is_internal_source(row["source"])]
+    providers = Counter(row["model_provider"] for row in user_rows)
+    return {
+        "codex_home": str(codex_home),
+        "database": str(database),
+        "current_provider": provider,
+        "integrity": "ok",
+        "total_records": len(rows),
+        "user_tasks": len(user_rows),
+        "visible_provider_tasks": len(user_rows),
+        "hidden_provider_tasks": 0,
+        "archived_user_tasks": sum(bool(row["archived"]) for row in user_rows),
+        "internal_subagents": len(internal_rows),
+        "missing_rollout_files": missing_rollouts,
+        "writer_locked_user_tasks": 0,
+        "hidden_writer_locked_tasks": 0,
+        "repairable_hidden_provider_tasks": 0,
+        "providers": dict(sorted(providers.items())),
+        "rollout_providers": {},
+        "runtime_provider_mismatch_tasks": 0,
+        "repairable_runtime_provider_tasks": 0,
+        "writer_locked_runtime_provider_tasks": 0,
+        "unresolved_runtime_provider_tasks": 0,
+        "provider_aliases_configured": [],
+        "provider_aliases_needed": [],
+        "provider_aliases_skipped_reserved": [],
+        "missing_session_meta": 0,
+    }
+
+
 def analyze(
     rows: Iterable[dict[str, Any]], provider: str, codex_home: Path, database: Path
 ) -> dict[str, Any]:
@@ -485,7 +710,9 @@ def analyze(
     hidden_rows = [row for row in user_rows if row["model_provider"] != provider]
     archived_rows = [row for row in user_rows if bool(row["archived"])]
     missing_rollouts = [
-        row for row in user_rows if not Path(row["rollout_path"]).expanduser().is_file()
+        row
+        for row in user_rows
+        if not resolve_rollout_path(row["rollout_path"], codex_home).is_file()
     ]
     locked_ids = writer_lock_ids(codex_home)
     locked_user_rows = [row for row in user_rows if row["id"] in locked_ids]
@@ -495,7 +722,7 @@ def analyze(
     ]
     providers = Counter(row["model_provider"] for row in user_rows)
     rollout_providers, rollout_mismatches, missing_session_meta = (
-        rollout_provider_analysis(user_rows, provider)
+        rollout_provider_analysis(user_rows, provider, codex_home)
     )
     mismatch_provider_names = {
         legacy_provider
@@ -583,7 +810,7 @@ def repair_next_action(report: dict[str, Any], changed: bool) -> str:
 
 def backup_database(source: sqlite3.Connection, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=False)
-    with sqlite3.connect(destination) as backup_conn:
+    with closing(sqlite3.connect(destination)) as backup_conn:
         source.backup(backup_conn)
         integrity_check(backup_conn)
 
@@ -625,7 +852,7 @@ def backup_rollout_rewrites(
             raise RepairError(
                 "A rollout became writer-locked after scanning; rerun the repair"
             )
-        path = Path(row["rollout_path"]).expanduser().resolve()
+        path = resolve_rollout_path(row["rollout_path"], codex_home)
         before, after, changed_events = prepare_rollout_rewrite(path, provider)
         rollout_backup_dir.mkdir(parents=True, exist_ok=True)
         backup_path = rollout_backup_dir / f"{row['id']}.jsonl"
@@ -656,7 +883,7 @@ def backup_rollout_snapshots(
     rollout_backup_dir = backup_dir / "rollouts"
     rollout_backup_dir.mkdir(parents=True, exist_ok=True)
     for row in rows:
-        path = Path(row["rollout_path"]).expanduser().resolve()
+        path = resolve_rollout_path(row["rollout_path"], codex_home)
         if not path.is_file():
             continue
         snapshot = None
@@ -767,6 +994,428 @@ def scan_command(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def codex_is_running() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode != 0 or '"Codex.exe"' in result.stdout
+
+
+def doctor_command(args: argparse.Namespace) -> dict[str, Any]:
+    report = scan_command(args)
+    cc_switch = shutil.which("cc-switch") is not None
+    schema_supported = True
+    safe = (
+        report["integrity"] == "ok"
+        and report["missing_rollout_files"] == 0
+        and not report["writer_locked_user_tasks"]
+        and not codex_is_running()
+    )
+    report.update(
+        {
+            "operation": "doctor",
+            "database_path": report["database"],
+            "database_schema_supported": schema_supported,
+            "sqlite_integrity": report["integrity"],
+            "session_count": report["total_records"],
+            "user_thread_count": report["user_tasks"],
+            "archived_thread_count": report["archived_user_tasks"],
+            "internal_thread_count": report["internal_subagents"],
+            "missing_rollout_count": report["missing_rollout_files"],
+            "writer_lock_count": report["writer_locked_user_tasks"],
+            "provider_mismatch_count": report["runtime_provider_mismatch_tasks"],
+            "cc_switch_detected": cc_switch,
+            # Unified History is not exposed through a stable public setting.
+            "cc_switch_unified_history_detected": None,
+            "guard_installed": (codex_home := resolve_codex_home(args.codex_home))
+            .joinpath("history-repair-state", "guard-installed.json")
+            .is_file(),
+            "guard_version": SCRIPT_VERSION,
+            "safe_to_bootstrap": safe,
+            "recommended_action": (
+                "bootstrap" if safe else report["next_action"]
+            ),
+        }
+    )
+    return report
+
+
+def guard_command(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.yes:
+        raise RepairError("Guard requires --yes")
+    codex_home = resolve_codex_home(args.codex_home)
+    database = resolve_database(codex_home, args.database)
+    provider, provider_source = parse_provider(codex_home / "config.toml", args.provider)
+
+    with open_database(database, readonly=True) as conn:
+        validate_schema(conn)
+        integrity_check(conn)
+        rows = load_threads(conn)
+    user_rows = [row for row in rows if not is_internal_source(row["source"])]
+    if codex_is_running() or writer_lock_ids(codex_home):
+        report = analyze(rows, provider, codex_home, database)
+        write_guard_state(codex_home, provider, "quit_codex_and_retry", user_rows=user_rows)
+        return {
+            **report,
+            "operation": "guard",
+            "provider_source": provider_source,
+            "changed": False,
+            "guard_complete": False,
+            "next_action": "quit_codex_and_retry",
+        }
+    sqlite_mismatch = any(row["model_provider"] != provider for row in user_rows)
+    state = read_guard_state(codex_home)
+    if (
+        not sqlite_mismatch
+        and guard_state_matches(state, provider, user_rows, codex_home)
+    ):
+        report = fast_guard_report(rows, provider, codex_home, database, 0)
+        state_written = write_guard_state(
+            codex_home, provider, "launch", user_rows=user_rows
+        )
+        return {
+            **report,
+            "operation": "guard",
+            "provider_source": provider_source,
+            "changed": False,
+            "guard_complete": True,
+            "next_action": "launch",
+            "backup_directory": None,
+            "repair_complete": True,
+            "guard_state_written": state_written,
+        }
+
+    # A mismatch, missing metadata, or an unreadable prefix requires the full
+    # analysis. This is the conservative path and is the only path allowed to
+    # rewrite rollout contents.
+    missing_rollouts, runtime_mismatches, unknown_runtime = quick_rollout_check(
+        user_rows, provider, codex_home
+    )
+    report = analyze(rows, provider, codex_home, database)
+
+    if report["missing_rollout_files"]:
+        write_guard_state(
+            codex_home, provider, "inspect_missing_rollouts", user_rows=user_rows
+        )
+        return {
+            **report,
+            "operation": "guard",
+            "provider_source": provider_source,
+            "changed": False,
+            "guard_complete": False,
+            "next_action": "inspect_missing_rollouts",
+        }
+    if report.get("missing_session_meta"):
+        write_guard_state(
+            codex_home, provider, "inspect_rollout_metadata", user_rows=user_rows
+        )
+        return {
+            **report,
+            "operation": "guard",
+            "provider_source": provider_source,
+            "changed": False,
+            "guard_complete": False,
+            "next_action": "inspect_rollout_metadata",
+        }
+    result = repair_command(
+        argparse.Namespace(
+            yes=True,
+            codex_home=str(codex_home),
+            database=str(database),
+            provider=args.provider,
+            unarchive=False,
+            index_only=True,
+        )
+    )
+    write_guard_state(
+        codex_home,
+        provider,
+        "launch" if result.get("repair_complete") else result.get("next_action", "repair"),
+        result.get("manifest"),
+        user_rows=user_rows,
+    )
+    return {
+        **result,
+        "operation": "guard",
+        "guard_complete": result.get("repair_complete", False),
+        "next_action": "launch" if result.get("repair_complete") else result["next_action"],
+    }
+
+
+def bootstrap_command(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.yes:
+        raise RepairError("Bootstrap requires --yes")
+    if os.name != "nt":
+        raise RepairError("The automatic Codex Continuity launcher is currently Windows-only")
+    codex_home = resolve_codex_home(args.codex_home)
+    if codex_is_running():
+        return {
+            "operation": "bootstrap",
+            "bootstrap_complete": False,
+            "changed": False,
+            "next_action": "quit_codex_and_retry",
+        }
+
+    initial = scan_command(args)
+    if initial["missing_rollout_files"]:
+        return {
+            **initial,
+            "operation": "bootstrap",
+            "bootstrap_complete": False,
+            "changed": False,
+            "next_action": "inspect_missing_rollouts",
+        }
+    if initial["writer_locked_user_tasks"]:
+        return {
+            **initial,
+            "operation": "bootstrap",
+            "bootstrap_complete": False,
+            "changed": False,
+            "next_action": "quit_codex_and_retry",
+        }
+
+    snapshot = snapshot_command(
+        argparse.Namespace(
+            yes=True,
+            codex_home=str(codex_home),
+            database=args.database,
+            provider=args.provider,
+        )
+    )
+    if not snapshot.get("snapshot_complete"):
+        return {
+            **snapshot,
+            "operation": "bootstrap",
+            "bootstrap_complete": False,
+            "next_action": "inspect_missing_rollouts",
+        }
+
+    repair = repair_command(
+        argparse.Namespace(
+            yes=True,
+            codex_home=str(codex_home),
+            database=args.database,
+            provider=args.provider,
+            unarchive=False,
+            index_only=True,
+        )
+    )
+    if not repair.get("repair_complete"):
+        return {
+            **repair,
+            "operation": "bootstrap",
+            "snapshot_directory": snapshot["backup_directory"],
+            "bootstrap_complete": False,
+            "next_action": repair["next_action"],
+        }
+
+    installer = Path(__file__).resolve().with_name("install_windows.ps1")
+    if not installer.is_file():
+        raise RepairError(f"Windows installer is missing: {installer}")
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(installer),
+        "-CodexHome",
+        str(codex_home),
+    ]
+    if args.codex_app_id:
+        command.extend(["-CodexAppId", args.codex_app_id])
+    installed = subprocess.run(
+        command, capture_output=True, text=True, timeout=30, check=False
+    )
+    if installed.returncode != 0:
+        return {
+            **repair,
+            "operation": "bootstrap",
+            "snapshot_directory": snapshot["backup_directory"],
+            "bootstrap_complete": False,
+            "guard_installed": False,
+            "installer_output": installed.stdout[-2000:],
+            "installer_error": installed.stderr[-2000:],
+            "next_action": "install_guard",
+        }
+
+    verification = scan_command(
+        argparse.Namespace(
+            codex_home=str(codex_home), database=args.database, provider=args.provider
+        )
+    )
+    marker = codex_home / "history-repair-state" / "guard-installed.json"
+    complete = verification["repair_complete"] and marker.is_file()
+    return {
+        **verification,
+        "operation": "bootstrap",
+        "bootstrap_complete": complete,
+        "snapshot_directory": snapshot["backup_directory"],
+        "repair_backup_directory": repair.get("backup_directory"),
+        "guard_installed": marker.is_file(),
+        "next_action": "none" if complete else "install_guard",
+        "changed": snapshot.get("changed", False) or repair.get("changed", False),
+    }
+
+
+def handoff_text(content: Any, allowed_types: set[str]) -> list[str]:
+    if not isinstance(content, list):
+        return []
+    texts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") not in allowed_types:
+            continue
+        value = item.get("text")
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+    return texts
+
+
+def handoff_event_text(event: dict[str, Any]) -> tuple[str, str] | None:
+    """Extract readable user/assistant text from known rollout event forms."""
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    event_type = event.get("type")
+    payload_type = payload.get("type")
+    if event_type == "event_msg":
+        if payload_type == "user_message":
+            role = "user"
+        elif payload_type in {"agent_message", "assistant_message"}:
+            role = "assistant"
+        else:
+            return None
+        value = payload.get("message")
+        if isinstance(value, str) and value.strip():
+            return role, value.strip()
+        return None
+    if event_type != "response_item" or payload_type != "message":
+        return None
+    role = payload.get("role")
+    if role == "user":
+        text = "\n".join(handoff_text(payload.get("content"), {"input_text"}))
+    elif role == "assistant":
+        text = "\n".join(handoff_text(payload.get("content"), {"output_text"}))
+    else:
+        return None
+    return (role, text) if text else None
+
+
+def handoff_command(args: argparse.Namespace) -> dict[str, Any]:
+    if args.max_messages < 1:
+        raise RepairError("--max-messages must be at least 1")
+    codex_home = resolve_codex_home(args.codex_home)
+    database = resolve_database(codex_home, args.database)
+    with open_database(database, readonly=True) as conn:
+        validate_schema(conn)
+        rows = load_threads(conn)
+    row = next(
+        (
+            item
+            for item in rows
+            if item["id"] == args.thread and not is_internal_source(item["source"])
+        ),
+        None,
+    )
+    if row is None:
+        raise RepairError(f"User thread not found: {args.thread}")
+    path = resolve_rollout_path(row["rollout_path"], codex_home)
+    if not path.is_file():
+        raise RepairError(f"Rollout file is missing: {path}")
+
+    messages: list[tuple[str, str]] = []
+    metadata: dict[str, Any] = {}
+    with path.open("rb") as handle:
+        for raw_line in handle:
+            try:
+                event = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if event.get("type") == "session_meta":
+                for key in ("id", "cwd", "model", "model_provider"):
+                    if isinstance(payload.get(key), (str, int, float)):
+                        metadata[key] = payload[key]
+                continue
+            extracted = handoff_event_text(event)
+            if extracted:
+                messages.append(extracted)
+
+    if not messages:
+        raise RepairError("No readable user/assistant text was found for this thread")
+    created_at = datetime.now().strftime("%Y%m%d-%H%M%S")
+    directory = codex_home / "history-repair-handoffs" / args.thread / created_at
+    directory.mkdir(parents=True, exist_ok=False)
+    metadata_path = directory / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {"thread_id": args.thread, "created_at": utc_now(), **metadata},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sections = [
+        "# Continuity handoff",
+        "",
+        f"- Source thread: `{args.thread}`",
+        f"- CWD: `{metadata.get('cwd', '')}`",
+        f"- Model: `{metadata.get('model', '')}`",
+        "",
+        "> This handoff includes readable user and assistant text only. It excludes tool output, reasoning events, encrypted content, and credentials.",
+        "",
+        "## Recent conversation",
+    ]
+    for role, text in messages[-args.max_messages :]:
+        sections.extend(["", f"### {role.title()}", "", text])
+    handoff_path = directory / "HANDOFF.md"
+    handoff_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+    source_manifest_path = directory / "source-manifest.json"
+    source_manifest_path.write_text(
+        json.dumps(
+            {
+                "manifest_version": 1,
+                "created_at": utc_now(),
+                "thread_id": args.thread,
+                "source_rollout": str(path),
+                "source_rollout_sha256": sha256_file(path),
+                "source_rollout_size": path.stat().st_size,
+                "source_metadata": metadata,
+                "readable_message_count": len(messages),
+                "exported_message_count": min(len(messages), args.max_messages),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "operation": "handoff",
+        "thread_id": args.thread,
+        "message_count": min(len(messages), args.max_messages),
+        "handoff": str(handoff_path),
+        "metadata": str(metadata_path),
+        "source_manifest": str(source_manifest_path),
+        "original_thread_preserved": True,
+        "changed": True,
+    }
+
+
 def snapshot_command(args: argparse.Namespace) -> dict[str, Any]:
     if not args.yes:
         raise RepairError("Snapshot requires --yes")
@@ -851,7 +1500,9 @@ def repair_command(args: argparse.Namespace) -> dict[str, Any]:
         integrity_check(conn)
         rows = load_threads(conn)
         user_rows = [row for row in rows if not is_internal_source(row["source"])]
-        _, rollout_mismatch_rows, _ = rollout_provider_analysis(user_rows, provider)
+        _, rollout_mismatch_rows, _ = rollout_provider_analysis(
+            user_rows, provider, codex_home
+        )
         discovered_legacy_providers = {
             legacy_provider
             for row in rollout_mismatch_rows
@@ -1110,7 +1761,7 @@ def undo_command(args: argparse.Namespace) -> dict[str, Any]:
             pre_undo_path = manifest_path.parent / (
                 f"pre-undo-{timestamp_slug()}-{uuid.uuid4().hex[:6]}.sqlite"
             )
-        with sqlite3.connect(pre_undo_path) as backup_conn:
+        with closing(sqlite3.connect(pre_undo_path)) as backup_conn:
             conn.backup(backup_conn)
             integrity_check(backup_conn)
         if config_path.is_file():
@@ -1270,6 +1921,36 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--yes", action="store_true", help="Confirm the repair")
     repair.add_argument("--json", action="store_true", help="Print JSON output")
 
+    doctor = subparsers.add_parser("doctor", help="Read-only continuity diagnostics")
+    add_location_arguments(doctor)
+    doctor.add_argument("--provider", help="Override the target model provider")
+    doctor.add_argument("--json", action="store_true", help="Print JSON output")
+
+    guard = subparsers.add_parser(
+        "guard", help="Synchronize metadata before launching Codex"
+    )
+    add_location_arguments(guard)
+    guard.add_argument("--provider", help="Override the target model provider")
+    guard.add_argument("--yes", action="store_true", help="Confirm the guard")
+    guard.add_argument("--json", action="store_true", help="Print JSON output")
+
+    bootstrap = subparsers.add_parser(
+        "bootstrap", help="Snapshot history and install the Windows launcher"
+    )
+    add_location_arguments(bootstrap)
+    bootstrap.add_argument("--provider", help="Override the target model provider")
+    bootstrap.add_argument("--codex-app-id", help="Optional Codex AppUserModelID")
+    bootstrap.add_argument("--yes", action="store_true", help="Confirm bootstrap")
+    bootstrap.add_argument("--json", action="store_true", help="Print JSON output")
+
+    handoff = subparsers.add_parser(
+        "handoff", help="Export readable conversation context to a new-thread brief"
+    )
+    add_location_arguments(handoff)
+    handoff.add_argument("--thread", required=True, help="Source thread id")
+    handoff.add_argument("--max-messages", type=int, default=40)
+    handoff.add_argument("--json", action="store_true", help="Print JSON output")
+
     undo = subparsers.add_parser("undo", help="Undo a repair from its manifest")
     add_location_arguments(undo)
     undo_group = undo.add_mutually_exclusive_group(required=True)
@@ -1290,6 +1971,14 @@ def main() -> int:
             result = snapshot_command(args)
         elif args.command == "repair":
             result = repair_command(args)
+        elif args.command == "doctor":
+            result = doctor_command(args)
+        elif args.command == "guard":
+            result = guard_command(args)
+        elif args.command == "bootstrap":
+            result = bootstrap_command(args)
+        elif args.command == "handoff":
+            result = handoff_command(args)
         else:
             result = undo_command(args)
         print_result(result, args.json)

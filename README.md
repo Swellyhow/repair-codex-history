@@ -1,128 +1,63 @@
-# repair-codex-history（有问题可联系：Timing-Courage）
+# repair-codex-history
 
-用于保护和恢复 Codex Desktop 本地历史对话的 Skill。它可以在切换账号、模型服务商或升级 Codex 前创建完整快照，也可以在对话从侧边栏消失、旧对话仍调用旧接口时执行修复。
+用于保护和恢复 Codex Desktop 本地历史对话，并在 Windows 上安装一次性的 Codex Pre-launch Guard。
+
+v6 的连续性模式只在启动 Codex 前运行一次：它读取当前有效的 `model_provider`，检查本机用户 Thread 的 provider 元数据，必要时在备份后同步 SQLite 索引和 rollout JSONL，然后启动 Codex。它不常驻后台、不安装服务、不监听配置文件，也不要求切换必须经过 CC Switch。
+
+因此，完成一次初始化后，日常操作是：切换 ChatGPT 账号、中转或 Provider，完全退出 Codex，再从 `Codex Continuity` 快捷方式启动。没有需要同步的变更时，Guard 直接快速退出。
 
 > [!IMPORTANT]
-> 本工具只能处理当前电脑上仍然存在的 Codex 本地对话文件，不能从云端找回已经删除或未同步到本机的对话。它不会读取或修改 `auth.json`、登录 Cookie、API Key、对话消息和工具输出。
+> 本项目只处理当前电脑上仍存在的本地 rollout 文件，不能从云端找回已经删除或未同步到本机的对话。它不读取或修改 `auth.json`、登录 Cookie、API Key、OAuth Token、用户消息、模型回复、工具输出或 `encrypted_content`。
 
-## 新手快速恢复
+## v6 连续性模式
 
-如果你已经切换账号，并且以前的对话不见了：
-
-1. 安装本 Skill，然后完全退出并重新打开 Codex。
-2. 新建一个对话，发送：
-
-   ```text
-   使用 $repair-codex-history 恢复切换账号后隐藏的所有本地对话
-   ```
-
-3. Skill 会先扫描，再自动备份和修复。
-4. 根据返回的 `next_action` 操作：
-
-   | `next_action` | 需要执行的操作 |
-   | --- | --- |
-   | `restart_and_rerun` | 完全退出 Codex，重新打开后再次发送相同的恢复指令 |
-   | `restart_to_reload` | 重启 Codex 一次，让侧边栏重新载入，无需再次修复 |
-   | `repair` / `repair_again` | 再执行一次修复 |
-   | `inspect_missing_rollouts` | 本地会话文件缺失，停止修改并检查备份 |
-   | `none` | 已完成，不需要继续操作 |
-
-当结果同时显示以下内容时，修复完成：
-
-```text
-repair_complete: true
-next_action: none
-```
-
-## 安装
-
-### 使用压缩包安装
-
-1. 从 [`dist/`](dist/) 下载 `repair-codex-history.zip`。
-2. 将压缩包解压到 Codex Skills 目录。
-
-macOS 或 Linux：
-
-```bash
-mkdir -p ~/.codex/skills
-unzip ~/Downloads/repair-codex-history.zip -d ~/.codex/skills
-```
-
-Windows PowerShell：
+在 Windows 上，从仓库目录运行：
 
 ```powershell
-New-Item -ItemType Directory -Force "$HOME\.codex\skills" | Out-Null
-Expand-Archive "$HOME\Downloads\repair-codex-history.zip" "$HOME\.codex\skills" -Force
+python scripts/repair_history.py doctor --json
+python scripts/repair_history.py bootstrap --yes --json
 ```
 
-安装完成后应存在：
+`bootstrap` 会先做只读诊断，再创建完整快照，按当前 provider 对齐本地用户历史，安装桌面上的 `Codex Continuity` 快捷方式，并重新校验结果。只有全部步骤成功才会返回：
+
+```json
+{"bootstrap_complete": true, "next_action": "none"}
+```
+
+如果 Codex 正在运行、存在 writer lock、SQLite 完整性检查失败、schema 不受支持或 rollout 文件缺失，bootstrap 会停止修改并返回明确的 `next_action`。先完全退出 Codex，再按结果重试；不要删除 lock 文件。
+
+安装后：
+
+1. 切换账号、中转或 Provider。
+2. 完全退出 Codex。
+3. 双击桌面的 `Codex Continuity`。
+
+快捷方式会运行 `guard --yes --json`。成功时返回 `guard_complete: true` 和 `next_action: launch`，然后启动 Codex。Guard 默认只同步 provider metadata，不创建 compatibility alias，也不覆盖 CC Switch 的 endpoint、API Key 或 OAuth 配置。
+
+如果 Guard 返回 `quit_codex_and_retry`，说明 Codex 或 writer lock 仍然存在；返回 `inspect_missing_rollouts` 时，本地文件已缺失，工具不会伪造历史；返回 `unsupported_schema` 时，工具不会猜测 SQL。
+
+## 跨 Provider 的边界
+
+Guard 负责本地历史可见性和 provider metadata 一致性。它会在已知 schema 上同步：
 
 ```text
-~/.codex/skills/repair-codex-history/SKILL.md
+threads.model_provider
+session_meta.payload.model_provider
 ```
 
-重新打开 Codex，即可通过 `$repair-codex-history` 使用。
+它不会保证不同 backend 能解密彼此产生的 `encrypted_content`。因此一个 Thread 可能已经重新出现在历史列表中，但当前 backend 仍无法原地 resume。这属于上游 backend 的兼容性边界，不是本地历史损坏。
 
-### 从仓库安装
-
-也可以克隆仓库并将 Skill 文件放入 Codex Skills 目录：
+遇到这种情况，保留原 Thread，生成一个新的连续性 handoff：
 
 ```bash
-git clone https://github.com/Swellyhow/repair-codex-history.git
-mkdir -p ~/.codex/skills/repair-codex-history
-cp repair-codex-history/SKILL.md ~/.codex/skills/repair-codex-history/
-cp -R repair-codex-history/agents repair-codex-history/scripts ~/.codex/skills/repair-codex-history/
+python scripts/repair_history.py handoff --thread THREAD_ID --json
 ```
 
-要求 Python 3.10 或更高版本。
+输出目录位于 `~/.codex/history-repair-handoffs/<thread-id>/<timestamp>/`，包含 `HANDOFF.md` 和 `metadata.json`。handoff 只提取可读的用户和 assistant 文本及基本会话元数据，不包含工具输出、隐藏 reasoning、`encrypted_content` 或凭据，原 Thread 永远保留。
 
-## 切换前保护
+账号 A → 账号 B 如果 provider 没有变化，Guard 通常是 no-op；它不读取 `auth.json`，也不判断邮箱。新请求使用当前 Codex 登录身份的配额、权限和模型访问。Relay A → Relay B 如果两者都使用同一个 provider 名称，也通常是 no-op；endpoint 或 Key 的管理仍由 Codex、CC Switch 或用户配置负责。
 
-如果还没有切换账号、provider 或升级 Codex，先发送：
-
-```text
-使用 $repair-codex-history 在切换前保护我的所有本地对话
-```
-
-Skill 会创建经过校验的完整快照，包括：
-
-- SQLite 状态数据库的在线备份
-- 所有用户对话 JSONL 文件
-- 当前 `config.toml`
-- 每个文件的 SHA-256 校验信息
-- 快照 manifest
-
-只有看到 `snapshot_complete: true` 后再继续切换。快照目录位于：
-
-```text
-~/.codex/history-repair-backups/
-```
-
-不要将该备份目录上传到公开仓库，其中可能包含本地项目路径和 provider 地址。
-
-### 切换模型服务商
-
-如果准备切换到另一个 provider，应先在 `config.toml` 中配置目标 provider，然后发送：
-
-```text
-使用 $repair-codex-history 在切换到 TARGET 前保护并迁移我的本地对话
-```
-
-Skill 会提前迁移未锁定对话，并为仍在运行的旧会话保留兼容映射。完成 provider 切换并重启 Codex 后，再运行一次扫描，根据 `next_action` 完成剩余步骤。
-
-## 恢复后使用哪个账号
-
-完成修复并重启 Codex 后，继续旧对话时使用的是：
-
-```text
-旧对话的本地上下文 + 当前登录的新账号
-```
-
-新请求的配额、计费、模型权限和身份属于当前账号。使用自定义 provider 时，请求使用当前 `config.toml` 中配置的接口和凭据。Skill 不会复制旧账号凭据。
-
-## 命令行使用
-
-通常只需在 Codex 中用自然语言调用 Skill。需要手动排查时，可在仓库目录执行以下命令。
+## v5 命令仍然可用
 
 只读扫描：
 
@@ -148,52 +83,83 @@ python3 scripts/repair_history.py repair --yes --json
 python3 scripts/repair_history.py repair --provider TARGET --yes --json
 ```
 
-撤销一次修复：
+撤销一次 repair、guard 或 bootstrap 产生的 operation manifest：
 
 ```bash
 python3 scripts/repair_history.py undo --backup /path/to/repair-backup --yes --json
 ```
 
-快照 manifest 不能用于 `undo`。撤销必须使用 `operation: repair` 的 manifest，这样才能避免覆盖修复后新产生的对话。
+`snapshot` 是灾备副本，不是 undo manifest。撤销应使用实际 repair 输出的备份目录；脚本会校验当前 hash，避免覆盖修复后新产生的内容。
 
-## 工作原理
+## 手动恢复流程
 
-Codex 会在 SQLite 中保存对话索引，同时在 rollout JSONL 的 `session_meta.payload.model_provider` 中保存 provider 信息。切换账号或 provider 后，这两处信息可能不一致，导致对话被隐藏，或者继续请求时仍调用旧地址。
+已经发生历史消失、旧对话仍请求旧接口等问题时，可以直接运行：
 
-本 Skill 会：
+```bash
+python3 scripts/repair_history.py scan --json
+python3 scripts/repair_history.py repair --yes --json
+```
 
-1. 检查 SQLite 完整性和本地 rollout 文件。
-2. 排除内部 subagent 任务。
-3. 跳过正在写入的 rollout 文件。
-4. 在修改前逐文件备份并记录修改前后 SHA-256。
-5. 只修改 `session_meta.payload.model_provider`。
-6. 同步 SQLite 对话索引。
-7. 必要时为旧 provider 创建指向当前接口的兼容配置。
-8. 使用原子替换写入文件，并提供基于 manifest 的安全撤销。
+修复前会检查 SQLite 完整性、rollout 是否存在和 writer lock。每次实际 rewrite 前都会创建备份并记录 SHA-256。rollout 只允许修改 `session_meta.payload.model_provider`；SQLite 只修改已验证 schema 中的 `threads.model_provider`。archived 状态默认保留，内部 subagent Thread 默认排除。
 
-普通对话消息和工具输出保持原始字节不变。
+常见 `next_action`：
 
-## 常见问题
+| 值 | 含义 |
+| --- | --- |
+| `none` | 已完成，无需继续操作 |
+| `restart_to_reload` | 重启 Codex 让侧边栏重新加载 |
+| `restart_and_rerun` | 重启后再次 scan/repair，补齐之前被锁定的任务 |
+| `quit_codex_and_retry` | 完全退出 Codex 后重试 Guard |
+| `inspect_missing_rollouts` | 本地 rollout 已缺失，停止修改 |
+| `unsupported_schema` | 数据库结构未知，停止修改 |
+| `handoff` | 当前 backend 无法原地续接时生成 handoff |
 
-### 为什么需要运行两次
+## 安装 Skill
 
-Codex 正在使用的对话会有 writer lock。Skill 不会修改活动文件，因此第一次修复会跳过它们。重启后锁会释放，再运行一次即可补齐。
+要求 Python 3.10 或更高版本。
 
-### 修复后重启还会丢失吗
+从仓库安装：
 
-当 `repair_complete` 为 `true` 时，SQLite 和 rollout provider 元数据已经一致，Codex 重建索引时不会再因为旧 provider 而隐藏这些对话。
+```bash
+git clone https://github.com/Swellyhow/repair-codex-history.git
+mkdir -p ~/.codex/skills/repair-codex-history
+cp repair-codex-history/SKILL.md ~/.codex/skills/repair-codex-history/
+cp -R repair-codex-history/agents repair-codex-history/scripts ~/.codex/skills/repair-codex-history/
+```
 
-### 会不会修改我的聊天内容
+Windows PowerShell：
 
-不会。修复只修改 provider 元数据，不修改用户消息、模型回复或工具输出。
+```powershell
+git clone https://github.com/Swellyhow/repair-codex-history.git
+New-Item -ItemType Directory -Force "$HOME\.codex\skills\repair-codex-history" | Out-Null
+Copy-Item .\repair-codex-history\SKILL.md "$HOME\.codex\skills\repair-codex-history\" -Force
+Copy-Item .\repair-codex-history\agents, .\repair-codex-history\scripts "$HOME\.codex\skills\repair-codex-history\" -Recurse -Force
+```
 
-### 可以找回另一台电脑或云端删除的对话吗
+也可以从 [`dist/repair-codex-history.zip`](dist/repair-codex-history.zip) 解压到 `~/.codex/skills/`。安装完成后重新打开 Codex，在对话中使用 `$repair-codex-history`。
 
-不可以。只有本机 rollout 文件仍然存在时才能恢复。
+## Skill 使用方式
 
-### 会读取旧账号密码或 Token 吗
+第一次安装连续性模式时，对 Skill 说：
 
-不会。脚本不会读取或修改 `auth.json`、API Key、Cookie 或登录凭据。
+```text
+使用 $repair-codex-history 安装一次性连续性模式。以后我切换 ChatGPT 账号、中转或 Provider 后，完全退出并重新打开 Codex 时自动同步本地历史。不要安装后台监控程序。
+```
+
+已经出现异常时，对 Skill 说：
+
+```text
+使用 $repair-codex-history 扫描并恢复切换 Provider 后隐藏的本地对话。
+```
+
+## 安全边界
+
+- 不读取、解析、备份或修改 `auth.json`。
+- 不记录 API Key、OAuth Token、Cookie、邮箱或完整配置。
+- 不修改用户消息、assistant 正文、tool output 或 `encrypted_content`。
+- 不删除 writer lock，不杀 Codex，不强制覆盖 active rollout。
+- 不自动 unarchive，不覆盖当前 Provider 配置，不把旧 endpoint 复制成当前配置。
+- 不从云端下载不存在本机的 Thread，也不绕过账号或模型权限。
 
 ## 项目结构
 
@@ -201,19 +167,21 @@ Codex 正在使用的对话会有 writer lock。Skill 不会修改活动文件�
 repair-codex-history/
 ├── README.md
 ├── SKILL.md
+├── repair-codex-history-v6-final-design.md
 ├── agents/
 │   └── openai.yaml
 ├── scripts/
-│   └── repair_history.py
+│   ├── repair_history.py
+│   ├── install_windows.ps1
+│   └── launch_codex_with_guard.ps1
+├── references/
+│   ├── continuity-architecture.md
+│   └── troubleshooting.md
+├── tests/
+│   └── test_repair_history_v6.py
 └── dist/
     ├── repair-codex-history.skill
     └── repair-codex-history.zip
 ```
 
-## 发布校验
-
-当前 v5 发布包 SHA-256：
-
-```text
-e62d867038b81e35da695d1b2bdf87d7ebe619ff0899cb5fef8168de10df53cb
-```
+完整设计记录见 [`repair-codex-history-v6-final-design.md`](repair-codex-history-v6-final-design.md)。

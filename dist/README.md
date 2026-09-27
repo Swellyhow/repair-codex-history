@@ -1,9 +1,9 @@
 # Distribution packages
 
-Both files contain the same v5 Skill package. Use `repair-codex-history.zip` for manual installation or `repair-codex-history.skill` when the Codex client supports direct Skill import.
+Both files contain the same v6 Skill package, including the Windows pre-launch Guard, handoff command, references, and installer scripts. Use `repair-codex-history.zip` for manual installation or `repair-codex-history.skill` when the Codex client supports direct Skill import.
 
 SHA-256:
 
 ```text
-e62d867038b81e35da695d1b2bdf87d7ebe619ff0899cb5fef8168de10df53cb
+2c9b296e91677fbaf7a8e08fb09f43c04beee8dd68b7bed35efa1a173d074e9b
 ```
