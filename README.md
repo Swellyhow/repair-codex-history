@@ -9,6 +9,26 @@ v6 的连续性模式只在启动 Codex 前运行一次：它读取当前有效�
 > [!IMPORTANT]
 > 本项目只处理当前电脑上仍存在的本地 rollout 文件，不能从云端找回已经删除或未同步到本机的对话。它不读取或修改 `auth.json`、登录 Cookie、API Key、OAuth Token、用户消息、模型回复、工具输出或 `encrypted_content`。
 
+## 用户只需发送一句话
+
+在 Codex 中直接发送下面这句话：
+
+```text
+安装 repair-codex-history 项目，并且实现不同账号下的历史会话同步。
+```
+
+Codex 应自动完成以下工作：
+
+1. 如果 Skill 尚未安装，调用仓库自举脚本从 `feat/session-continuity-v6` 分支安装本项目，并把 `SKILL.md`、`agents/`、`scripts/` 和 `references/` 安装到当前用户的 Codex Skill 目录；脚本只执行只读 `doctor`，不触碰本地历史。
+2. 读取当前有效的 `model_provider`，运行只读诊断。
+3. 在 Windows 上运行一次 `bootstrap`：创建快照、同步仍存在本机的用户历史、安装 `Codex Continuity` 快捷方式并复核结果。
+4. 在 macOS/Linux 上安装 Skill，并运行安全的 `snapshot` + `repair` 流程；这些平台当前没有仓库内置的自动启动快捷方式。
+5. 报告 `next_action`、备份目录和后续只需执行的动作。
+
+首次安装时，如果当前 Codex 进程不能热加载新 Skill，先完全退出并重新打开 Codex，再发送同一句话继续；不要把“已安装”误认为“已完成同步”。如果 Codex 已能加载 Skill 但仍在使用数据库或 writer lock，它会返回 `quit_codex_and_retry`，用户只需完全退出 Codex，再重试或在 Windows 上双击新建的 `Codex Continuity` 快捷方式。这个安全边界不能通过删除 lock 文件绕过。
+
+完成初始化后，日常流程只有：切换账号、中转或 Provider，完全退出 Codex，再从 `Codex Continuity` 启动（Windows），或重新打开 Codex 后让已安装的 Skill 执行 `scan/repair`（macOS/Linux）。如果账号切换没有改变 provider，或两个中转都使用同一个 provider 名称，通常会是 no-op，不会改写历史。
+
 ## v6 连续性模式
 
 在 Windows 上，从仓库目录运行：
@@ -118,13 +138,13 @@ python3 scripts/repair_history.py repair --yes --json
 
 要求 Python 3.10 或更高版本。
 
-从仓库安装：
+如果用户没有通过 Codex 一句话入口安装，也可以手动从仓库安装：
 
 ```bash
 git clone https://github.com/Swellyhow/repair-codex-history.git
 mkdir -p ~/.codex/skills/repair-codex-history
 cp repair-codex-history/SKILL.md ~/.codex/skills/repair-codex-history/
-cp -R repair-codex-history/agents repair-codex-history/scripts ~/.codex/skills/repair-codex-history/
+cp -R repair-codex-history/agents repair-codex-history/scripts repair-codex-history/references ~/.codex/skills/repair-codex-history/
 ```
 
 Windows PowerShell：
@@ -133,17 +153,17 @@ Windows PowerShell：
 git clone https://github.com/Swellyhow/repair-codex-history.git
 New-Item -ItemType Directory -Force "$HOME\.codex\skills\repair-codex-history" | Out-Null
 Copy-Item .\repair-codex-history\SKILL.md "$HOME\.codex\skills\repair-codex-history\" -Force
-Copy-Item .\repair-codex-history\agents, .\repair-codex-history\scripts "$HOME\.codex\skills\repair-codex-history\" -Recurse -Force
+Copy-Item .\repair-codex-history\agents, .\repair-codex-history\scripts, .\repair-codex-history\references "$HOME\.codex\skills\repair-codex-history\" -Recurse -Force
 ```
 
 也可以从 [`dist/repair-codex-history.zip`](dist/repair-codex-history.zip) 解压到 `~/.codex/skills/`。安装完成后重新打开 Codex，在对话中使用 `$repair-codex-history`。
 
 ## Skill 使用方式
 
-第一次安装连续性模式时，对 Skill 说：
+一句话入口等价于下面的 Skill 请求；需要查看或重复初始化时可以直接发送：
 
 ```text
-使用 $repair-codex-history 安装一次性连续性模式。以后我切换 ChatGPT 账号、中转或 Provider 后，完全退出并重新打开 Codex 时自动同步本地历史。不要安装后台监控程序。
+使用 $repair-codex-history 安装一次性连续性模式，并同步不同账号下仍存在本机的历史会话。先完成 doctor；Windows 执行 bootstrap，macOS/Linux 执行 snapshot 和 repair。不要安装后台监控程序。
 ```
 
 已经出现异常时，对 Skill 说：
@@ -171,6 +191,8 @@ repair-codex-history/
 ├── agents/
 │   └── openai.yaml
 ├── scripts/
+│   ├── install_from_github.ps1
+│   ├── install_from_github.sh
 │   ├── repair_history.py
 │   ├── install_windows.ps1
 │   └── launch_codex_with_guard.ps1

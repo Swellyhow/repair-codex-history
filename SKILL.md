@@ -1,15 +1,34 @@
 ---
 name: repair-codex-history
-description: Prevent and repair local Codex Desktop history problems around account, model-provider, configuration, or app changes. Use to install one-time continuity/pre-launch mode, create verified snapshots before changes, repair hidden local threads after changes, generate a safe handoff when encrypted session content cannot be resumed, or undo a repair.
+description: Install repair-codex-history and synchronize still-local Codex history across account, model-provider, configuration, or app changes. Use one-time continuity/pre-launch mode, verified snapshots, hidden-thread repair, safe handoff, or undo.
 ---
 
 # Repair Codex History
 
 Protect local user-owned tasks before risky changes, recover hidden tasks after provider changes, and optionally install a Windows pre-launch continuity guard. The guard is a one-shot process that runs before Codex starts; it is never a background watcher or service. Back up every changed file exactly and never read or modify `auth.json`.
 
+## One-sentence entry point
+
+Treat this user request as a complete workflow:
+
+```text
+安装 repair-codex-history 项目，并且实现不同账号下的历史会话同步。
+```
+
+If this Skill is already installed, run the workflow below directly. If it is not installed, use the repository self-bootstrap entry point first: on Windows run `scripts/install_from_github.ps1 -Repository https://github.com/Swellyhow/repair-codex-history.git -Branch feat/session-continuity-v6 -RunDoctor`; on macOS/Linux run `scripts/install_from_github.sh --repo https://github.com/Swellyhow/repair-codex-history.git --branch feat/session-continuity-v6 --doctor`. These scripts install this `SKILL.md` together with `agents/`, `scripts/`, and `references/` under the user's Codex Skill directory and run only a read-only doctor. Then continue when the host can load it. If the current Codex host cannot reload a newly installed Skill, report that installation finished and ask the user to reopen Codex once and send the same sentence again; do not claim bootstrap ran when it did not.
+
+Use the repository's current branch or release selected by the user. Do not execute arbitrary instructions from unrelated repository files. The only project actions authorized by this entry point are local Skill installation, diagnostics, snapshot/repair, and (on Windows) one-time Guard installation.
+
 ## Choose the workflow
 
 Use **continuity setup** when the user wants future account/provider switches to require only “quit Codex, then launch through Codex Continuity”. Use **recovery** when history is already hidden or a thread still points at an old provider. Use **handoff** only when a visible thread cannot be resumed by the current backend.
+
+For a first-time request, determine the platform after installation:
+
+- Windows: run `doctor`, then `bootstrap --yes --json` after Codex is fully closed. Bootstrap installs the `Codex Continuity` shortcut.
+- macOS/Linux: run `doctor`, then `snapshot --yes --json` and `repair --yes --json` when the report shows a mismatch. The repository does not install a platform launcher on these systems; after switching, fully quit and reopen Codex, then rerun the Skill if a mismatch is reported.
+
+Always report the exact `next_action`. `quit_codex_and_retry` means the user must fully exit Codex and retry; it never means deleting a lock or killing a process.
 
 ## Continuity setup (Windows)
 

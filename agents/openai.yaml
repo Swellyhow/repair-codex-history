@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex 本地历史连续性"
   short_description: "安装启动前 Guard，安全恢复并支持撤销"
-  default_prompt: "使用 $repair-codex-history 先运行 doctor：如果用户要长期无感切换，执行一次 bootstrap 安装非后台 Guard；如果历史已隐藏，执行 scan/repair；跨 backend 无法续接时生成 handoff，并严格遵循 next_action。"
+  default_prompt: "用户说‘安装 repair-codex-history 项目，并且实现不同账号下的历史会话同步’时，把它当作完整任务：若 Skill 未安装，先用 scripts/install_from_github.ps1 或 scripts/install_from_github.sh 从 https://github.com/Swellyhow/repair-codex-history.git 的 feat/session-continuity-v6 分支安装 SKILL.md、agents、scripts、references，并只运行只读 doctor；然后继续工作流。Windows 在 Codex 完全退出后执行 bootstrap 安装一次性非后台 Guard；macOS/Linux 执行 snapshot，并仅在 doctor/scan 报告不一致时执行 repair。已隐藏历史执行 scan/repair；跨 backend 无法续接时生成 handoff。严格遵循 next_action，不读取或修改 auth.json，不安装后台监控。"

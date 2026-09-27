@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
@@ -97,6 +98,133 @@ def command_args(home: Path, database: Path, **kwargs: object) -> Namespace:
 
 
 class V6RepairHistoryTests(unittest.TestCase):
+    def test_one_prompt_skill_entrypoint_exposes_setup_and_recovery_paths(self) -> None:
+        """The installed skill metadata must give Codex enough routing context."""
+        skill_root = SCRIPT.parent.parent
+        agent_yaml = skill_root / "agents" / "openai.yaml"
+        content = agent_yaml.read_text(encoding="utf-8")
+        self.assertIn("default_prompt:", content)
+        self.assertTrue(
+            "$repair-codex-history" in content
+            or "repair-codex-history" in content
+        )
+        for cue in ("doctor", "bootstrap", "scan/repair", "handoff", "next_action"):
+            self.assertIn(cue, content)
+
+    def test_cli_exposes_one_prompt_bootstrap_contract(self) -> None:
+        parser = repair_history.build_parser()
+
+        doctor = parser.parse_args(["doctor", "--json"])
+        self.assertEqual(doctor.command, "doctor")
+        self.assertTrue(doctor.json)
+
+        bootstrap = parser.parse_args(["bootstrap", "--yes", "--json"])
+        self.assertEqual(bootstrap.command, "bootstrap")
+        self.assertTrue(bootstrap.yes)
+        self.assertTrue(bootstrap.json)
+        self.assertIsNone(bootstrap.codex_app_id)
+
+    def test_bootstrap_orchestrates_snapshot_repair_install_and_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "codex home"
+            home.mkdir()
+            args = Namespace(
+                codex_home=str(home),
+                database=None,
+                provider=None,
+                codex_app_id="Codex.App_123!abc",
+                yes=True,
+                json=True,
+            )
+            initial = {
+                "operation": "scan",
+                "missing_rollout_files": 0,
+                "writer_locked_user_tasks": 0,
+            }
+            verification = {"repair_complete": True, "provider": "custom"}
+            snapshot_call: dict[str, Namespace] = {}
+            repair_call: dict[str, Namespace] = {}
+
+            def fake_snapshot(command: Namespace) -> dict[str, object]:
+                snapshot_call["args"] = command
+                return {
+                    "snapshot_complete": True,
+                    "backup_directory": str(home / "snapshot"),
+                    "changed": False,
+                }
+
+            def fake_repair(command: Namespace) -> dict[str, object]:
+                repair_call["args"] = command
+                return {
+                    "repair_complete": True,
+                    "backup_directory": str(home / "repair"),
+                    "changed": True,
+                }
+
+            def fake_install(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                self.assertIn("-File", command)
+                installer = Path(command[command.index("-File") + 1])
+                self.assertEqual(installer.name, "install_windows.ps1")
+                self.assertIn("-CodexHome", command)
+                self.assertEqual(Path(command[command.index("-CodexHome") + 1]), home)
+                self.assertIn("-CodexAppId", command)
+                self.assertEqual(
+                    command[command.index("-CodexAppId") + 1], "Codex.App_123!abc"
+                )
+                self.assertNotIn("auth.json", " ".join(command))
+                marker = home / "history-repair-state" / "guard-installed.json"
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text('{"version":6}\n', encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "installed", "")
+
+            with (
+                patch.object(repair_history.os, "name", "nt"),
+                patch.object(repair_history, "codex_is_running", return_value=False),
+                patch.object(repair_history, "scan_command", side_effect=[initial, verification]),
+                patch.object(repair_history, "snapshot_command", side_effect=fake_snapshot),
+                patch.object(repair_history, "repair_command", side_effect=fake_repair),
+                patch.object(repair_history.subprocess, "run", side_effect=fake_install),
+            ):
+                result = repair_history.bootstrap_command(args)
+
+            self.assertTrue(result["bootstrap_complete"])
+            self.assertEqual(result["next_action"], "none")
+            self.assertTrue(result["guard_installed"])
+            self.assertTrue(snapshot_call["args"].yes)
+            self.assertTrue(repair_call["args"].yes)
+            self.assertTrue(repair_call["args"].index_only)
+
+    def test_windows_installer_only_creates_launcher_state(self) -> None:
+        installer = SCRIPT.parent / "install_windows.ps1"
+        content = installer.read_text(encoding="utf-8")
+
+        self.assertIn("CreateShortcut", content)
+        self.assertIn("guard-installed.json", content)
+        # Installing the skill must not copy local credentials or conversation data.
+        for forbidden in ("auth.json", "Copy-Item", "rollouts", "state_*.sqlite"):
+            self.assertNotIn(forbidden, content)
+
+    def test_github_installers_copy_only_installable_skill_payload(self) -> None:
+        """One-command installers must never copy local state or credentials."""
+        installers = (
+            SCRIPT.parent / "install_from_github.ps1",
+            SCRIPT.parent / "install_from_github.sh",
+        )
+        for installer in installers:
+            self.assertTrue(installer.is_file(), installer)
+            content = installer.read_text(encoding="utf-8")
+            for required in ("SKILL.md", "agents", "scripts", "references"):
+                self.assertIn(required, content, installer)
+            self.assertIn("feat/session-continuity-v6", content, installer)
+            for forbidden in (
+                "auth.json",
+                "state_*.sqlite",
+                "history-repair-backups",
+                "rollouts/",
+                "rollouts\\",
+            ):
+                self.assertNotIn(forbidden, content, installer)
+
     def test_prepare_rollout_rewrite_changes_only_session_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rollout.jsonl"
